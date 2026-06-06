@@ -1,0 +1,361 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ---------- LCD Configuration ----------
+#define LCD_ADDRESS 0x27
+#define LCD_COLUMNS 16
+#define LCD_ROWS 2
+LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
+
+// ---------- Motor Pins ----------
+#define LEFT_IN1 22
+#define LEFT_IN2 24
+#define RIGHT_IN1 26
+#define RIGHT_IN2 28
+
+// ---------- Line Sensor Pins ----------
+#define S1 23
+#define S2 25
+#define S3 27
+#define S4 29
+#define S5 31
+
+// ---------- Ultrasonic ----------
+#define TRIG_PIN 7
+#define ECHO_PIN 6
+
+// ---------- TCS3200 ----------
+#define S0_PIN 8
+#define S1_PIN 9
+#define S2_PIN 2
+#define S3_PIN 3
+#define OUT_PIN 4
+
+// ---------- General Settings ----------
+#define LINE_DETECTED LOW
+#define INVERT_LEFT_MOTOR false
+#define INVERT_RIGHT_MOTOR false
+
+#define SPEED 60
+#define ZIG_STEP_MS 40
+#define TURN_STEP_MS 50
+#define BACKUP_MS 20
+
+#define OBSTACLE_DIST_MM 50
+#define TURN_DURATION 300
+
+// ---------- Colour Detection ----------
+#define COLOR_AVG_SAMPLES 5
+
+// ** CALIBRATION THRESHOLDS – ADAPT AFTER SERIAL OUTPUT **
+// After running calibration, replace these values with your observed RGB frequencies.
+// For example, if red gives R=300, G=800, B=700, then:
+#define RED_R_MAX 400 // Red frequency must be less than this
+#define RED_G_MIN 500 // Green frequency must be greater than this
+#define RED_B_MIN 500 // Blue frequency must be greater than this
+// For non-red (other colours), we'll use opposite logic.
+
+// ---------- Global Variables ----------
+bool lineSensors[5];
+int lastLineDirection = 0;
+bool zigState = false;
+
+float distance_mm = 0;
+unsigned int redFreq = 0, greenFreq = 0, blueFreq = 0;
+String detectedColor = "Unknown";
+bool isRed = false;
+String currentAction = "IDLE";
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(9600);
+  Serial.println("=== CALIBRATION MODE: Place known colours under sensor ===");
+  Serial.println("Watch serial output for R,G,B values. Then adjust thresholds.");
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.print("Calibrating...");
+  delay(2000);
+
+  // Motor pins
+  pinMode(LEFT_IN1, OUTPUT);
+  pinMode(LEFT_IN2, OUTPUT);
+  pinMode(RIGHT_IN1, OUTPUT);
+  pinMode(RIGHT_IN2, OUTPUT);
+
+  // Line sensor pins
+  int sensorPins[] = {S1, S2, S3, S4, S5};
+  for (int i = 0; i < 5; i++) pinMode(sensorPins[i], INPUT);
+
+  // Ultrasonic
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // TCS3200
+  pinMode(S0_PIN, OUTPUT);
+  pinMode(S1_PIN, OUTPUT);
+  pinMode(S2_PIN, OUTPUT);
+  pinMode(S3_PIN, OUTPUT);
+  pinMode(OUT_PIN, INPUT);
+  digitalWrite(S0_PIN, HIGH);
+  digitalWrite(S1_PIN, LOW); // 20% scaling
+
+  stopMotors();
+  delay(500);
+  lcd.clear();
+  lcd.print("Ready");
+  delay(1000);
+  lcd.clear();
+
+  // Uncomment the following line to run a continuous colour debug (no obstacle needed)
+  // while(1) { readColorDebug(); delay(1000); }
+}
+
+// ---------- Main Loop ----------
+void loop() {
+  readUltrasonic();
+
+  if (distance_mm < OBSTACLE_DIST_MM && distance_mm > 0) {
+    identifyColor(); // reads RGB and sets isRed
+    if (isRed) {
+      currentAction = "RED->L";
+      Serial.println("Obstacle + RED → turning LEFT");
+      turnLeftForDuration(TURN_DURATION);
+    } else {
+      currentAction = "OTH->R";
+      Serial.print("Obstacle + ");
+      Serial.print(detectedColor);
+      Serial.println(" → turning RIGHT");
+      turnRightForDuration(TURN_DURATION);
+    }
+    updateLCD();
+    delay(200);
+    return;
+  }
+
+  readLineSensors();
+  followLineWithFeedback();
+  updateLCD();
+  delay(5);
+}
+
+// ========== ULTRASONIC ==========
+void readUltrasonic() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duration == 0) distance_mm = 9999;
+  else distance_mm = duration * 0.34 / 2.0;
+}
+
+// ========== COLOUR READING (raw frequencies) ==========
+unsigned int readFrequencyAvg(int s2Val, int s3Val, int samples) {
+  unsigned long total = 0;
+  for (int i = 0; i < samples; i++) {
+    digitalWrite(S2_PIN, s2Val);
+    digitalWrite(S3_PIN, s3Val);
+    delayMicroseconds(60);
+    unsigned long start = micros();
+    unsigned int count = 0;
+    while (micros() - start < 100000) {
+      if (digitalRead(OUT_PIN) == LOW) {
+        count++;
+        while (digitalRead(OUT_PIN) == LOW);
+      }
+    }
+    total += count;
+  }
+  return total / samples;
+}
+
+// ========== COLOUR IDENTIFICATION WITH THRESHOLDS ==========
+void identifyColor() {
+  // Read RGB frequencies
+  redFreq = readFrequencyAvg(LOW, LOW, COLOR_AVG_SAMPLES);
+  greenFreq = readFrequencyAvg(HIGH, HIGH, COLOR_AVG_SAMPLES);
+  blueFreq = readFrequencyAvg(LOW, HIGH, COLOR_AVG_SAMPLES);
+
+  // Prevent division by zero
+  if (redFreq == 0) redFreq = 1;
+  if (greenFreq == 0) greenFreq = 1;
+  if (blueFreq == 0) blueFreq = 1;
+
+  // ** CLASSIFICATION BASED ON CALIBRATED THRESHOLDS **
+  // For red: red frequency low, green and blue high
+  bool redCondition = (redFreq < RED_R_MAX) && (greenFreq > RED_G_MIN) && (blueFreq > RED_B_MIN);
+  
+  // Optional: also check ratio (R/(G+B)) if needed
+  // float ratio = (float)redFreq / (greenFreq + blueFreq);
+  // bool redCondition = (ratio < 0.5); // typical for red
+
+  if (redCondition) {
+    detectedColor = "RED";
+    isRed = true;
+  } else {
+    detectedColor = "OTHER";
+    isRed = false;
+  }
+
+  // Debug output – very important for calibration
+  Serial.print("RGB: ");
+  Serial.print(redFreq);
+  Serial.print(", ");
+  Serial.print(greenFreq);
+  Serial.print(", ");
+  Serial.print(blueFreq);
+  Serial.print(" -> ");
+  Serial.print(detectedColor);
+  Serial.print(isRed ? " (RED)" : " (NOT RED)");
+  Serial.println();
+}
+
+// ========== LINE SENSORS ==========
+void readLineSensors() {
+  lineSensors[0] = (digitalRead(S1) == LINE_DETECTED);
+  lineSensors[1] = (digitalRead(S2) == LINE_DETECTED);
+  lineSensors[2] = (digitalRead(S3) == LINE_DETECTED);
+  lineSensors[3] = (digitalRead(S4) == LINE_DETECTED);
+  lineSensors[4] = (digitalRead(S5) == LINE_DETECTED);
+}
+
+// ========== MOTOR CONTROL ==========
+void setLeftMotorRaw(int dir) {
+  if (INVERT_LEFT_MOTOR) dir = -dir;
+  if (dir > 0) {
+    digitalWrite(LEFT_IN1, HIGH);
+    digitalWrite(LEFT_IN2, LOW);
+  } else if (dir < 0) {
+    digitalWrite(LEFT_IN1, LOW);
+    digitalWrite(LEFT_IN2, HIGH);
+  } else {
+    digitalWrite(LEFT_IN1, LOW);
+    digitalWrite(LEFT_IN2, LOW);
+  }
+}
+
+void setRightMotorRaw(int dir) {
+  if (INVERT_RIGHT_MOTOR) dir = -dir;
+  if (dir > 0) {
+    digitalWrite(RIGHT_IN1, HIGH);
+    digitalWrite(RIGHT_IN2, LOW);
+  } else if (dir < 0) {
+    digitalWrite(RIGHT_IN1, LOW);
+    digitalWrite(RIGHT_IN2, HIGH);
+  } else {
+    digitalWrite(RIGHT_IN1, LOW);
+    digitalWrite(RIGHT_IN2, LOW);
+  }
+}
+
+void stopMotors() {
+  setLeftMotorRaw(0);
+  setRightMotorRaw(0);
+}
+
+void motorWithSpeed(int leftDir, int rightDir, int duration) {
+  unsigned long start = millis();
+  unsigned long cycleTime = 20;
+  unsigned long onTime = (cycleTime * SPEED) / 100;
+  unsigned long offTime = cycleTime - onTime;
+  while (millis() - start < duration) {
+    setLeftMotorRaw(leftDir);
+    setRightMotorRaw(rightDir);
+    delay(onTime);
+    setLeftMotorRaw(0);
+    setRightMotorRaw(0);
+    delay(offTime);
+  }
+}
+
+void turnLeftForDuration(int duration) {
+  stopMotors();
+  delay(10);
+  motorWithSpeed(-1, 1, duration);
+  stopMotors();
+}
+
+void turnRightForDuration(int duration) {
+  stopMotors();
+  delay(10);
+  motorWithSpeed(1, -1, duration);
+  stopMotors();
+}
+
+// ========== LINE FOLLOWING ==========
+void followLineWithFeedback() {
+  bool farLeft = lineSensors[0];
+  bool left = lineSensors[1];
+  bool center = lineSensors[2];
+  bool right = lineSensors[3];
+  bool farRight = lineSensors[4];
+
+  if (center) {
+    lastLineDirection = 0;
+    if (left && !right) {
+      currentAction = "S L";
+      motorWithSpeed(0, 1, TURN_STEP_MS);
+    } else if (right && !left) {
+      currentAction = "S R";
+      motorWithSpeed(1, 0, TURN_STEP_MS);
+    } else {
+      currentAction = zigState ? "ZIG R" : "ZIG L";
+      if (zigState) motorWithSpeed(1, 0, ZIG_STEP_MS);
+      else motorWithSpeed(0, 1, ZIG_STEP_MS);
+      zigState = !zigState;
+    }
+  }
+  else if (farLeft) {
+    lastLineDirection = -1;
+    currentAction = "H L";
+    motorWithSpeed(-1, 1, TURN_STEP_MS * 1.5);
+  }
+  else if (left) {
+    lastLineDirection = -1;
+    currentAction = "S L";
+    motorWithSpeed(0, 1, TURN_STEP_MS);
+  }
+  else if (farRight) {
+    lastLineDirection = 1;
+    currentAction = "H R";
+    motorWithSpeed(1, -1, TURN_STEP_MS * 1.5);
+  }
+  else if (right) {
+    lastLineDirection = 1;
+    currentAction = "S R";
+    motorWithSpeed(1, 0, TURN_STEP_MS);
+  }
+  else {
+    currentAction = "REC";
+    stopMotors();
+    delay(10);
+    motorWithSpeed(-1, -1, BACKUP_MS);
+    stopMotors();
+    delay(10);
+    if (lastLineDirection < 0) motorWithSpeed(0, 1, TURN_STEP_MS * 1.5);
+    else if (lastLineDirection > 0) motorWithSpeed(1, 0, TURN_STEP_MS * 1.5);
+    else motorWithSpeed(0, 1, TURN_STEP_MS * 2);
+  }
+  stopMotors();
+}
+
+// ========== LCD UPDATE ==========
+void updateLCD() {
+  char lineStr[6];
+  for (int i = 0; i < 5; i++) lineStr[i] = lineSensors[i] ? '1' : '0';
+  lineStr[5] = '\0';
+
+  lcd.setCursor(0, 0);
+  char row0[17];
+  snprintf(row0, 17, "L:%-5s D:%3d", lineStr, (int)distance_mm);
+  lcd.print(row0);
+
+  lcd.setCursor(0, 1);
+  char row1[17];
+  String colShort = detectedColor.substring(0, 4);
+  snprintf(row1, 17, "C:%-4s %-6s", colShort.c_str(), currentAction.c_str());
+  lcd.print(row1);
+}
